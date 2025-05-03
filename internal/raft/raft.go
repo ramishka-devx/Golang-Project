@@ -138,20 +138,16 @@ func (n *Node) ticker() {
 		case <-n.stopCh:
 			return
 		case <-n.electionTimer.C:
-			n.mu.RLock()
-			isLeader := n.state == Leader
-			n.mu.RUnlock()
-
-			if !isLeader { // only followers / candidates start elections
-				// run election logic in its *own* goroutine so the ticker
-				// continues to service heart-beats and term updates.
+			// Use a single atomic read to check state
+			state := atomic.LoadInt32((*int32)(&n.state))
+			if state != int32(Leader) {
+				// Run election logic in its own goroutine
 				go n.startElection()
 			}
 		case <-n.heartbeatTimerC():
-			n.mu.RLock()
-			leader := n.state == Leader
-			n.mu.RUnlock()
-			if leader {
+			// Use a single atomic read to check state
+			state := atomic.LoadInt32((*int32)(&n.state))
+			if state == int32(Leader) {
 				n.broadcastAppendEntries()
 			}
 			n.heartbeatTimer.Reset(config.HeartbeatInterval)
@@ -194,13 +190,10 @@ func (n *Node) startElection() {
 	// step up to candidate & bump term
 	n.mu.Lock()
 	n.state = Candidate
-
 	n.currentTerm++
 	n.store.SetTerm(n.currentTerm)
-
 	n.votedFor = n.id
 	n.store.SetVotedFor(n.id)
-
 	term := n.currentTerm
 	lastIdx, lastTerm := n.log.LastIndexTerm()
 	n.resetElectionTimer()
@@ -235,6 +228,7 @@ func (n *Node) startElection() {
 			if reply.VoteGranted && reply.Term == term {
 				if atomic.AddInt32(&votes, 1) > int32(len(n.peers)/2) {
 					n.mu.Lock()
+					// Double check state and term haven't changed
 					if n.state == Candidate && n.currentTerm == term {
 						n.becomeLeader()
 					}
@@ -279,7 +273,7 @@ func (n *Node) becomeLeader() {
 }
 
 func (n *Node) broadcastAppendEntries() {
-	// capture a *snapshot* of leader’s state under read-lock
+	// capture a *snapshot* of leader's state under read-lock
 	n.mu.RLock()
 	if n.state != Leader {
 		n.mu.RUnlock()

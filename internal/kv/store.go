@@ -16,6 +16,7 @@ type GetCmd struct{ Key string }
 type Store struct {
 	db  *bolt.DB
 	lru *lruCache
+	mu  sync.RWMutex  // Add mutex for store-wide synchronization
 }
 
 func New(db *bolt.DB, maxEntries int) *Store {
@@ -27,29 +28,53 @@ func New(db *bolt.DB, maxEntries int) *Store {
 	return &Store{db: db, lru: newLRU(maxEntries)}
 }
 
-func (s *Store) Close() { _ = s.db.Close() }
+func (s *Store) Close() { 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.db.Close() 
+}
 
 /* ─────────────────── API ───────────────────────── */
 
 func (s *Store) Get(key string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	
 	if v, ok := s.lru.get(key); ok {
 		return v
 	}
-	return ""
+	
+	// If not in cache, read from DB and update cache
+	var value string
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket([]byte("kv")).Get([]byte(key)); v != nil {
+			value = string(v)
+		}
+		return nil
+	})
+	
+	if value != "" {
+		s.lru.add(key, value)
+	}
+	return value
 }
 
 func (s *Store) Apply(cmd any) any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
 	switch c := cmd.(type) {
-
 	case SetCmd:
 		_ = s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket([]byte("kv")).Put([]byte(c.Key), []byte(c.Value))
 		})
+		s.lru.add(c.Key, c.Value)  // Update cache after DB write
 
 	case DelCmd:
 		_ = s.db.Update(func(tx *bolt.Tx) error {
 			return tx.Bucket([]byte("kv")).Delete([]byte(c.Key))
 		})
+		s.lru.remove(c.Key)  // Remove from cache after DB delete
 
 	case GetCmd:
 		return s.Get(c.Key)

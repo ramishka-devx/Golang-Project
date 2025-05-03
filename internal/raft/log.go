@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
+	"fmt"
 	"sync"
 
 	bolt "go.etcd.io/bbolt"
@@ -42,18 +43,30 @@ type boltLog struct {
 
 func NewBoltLog(db *bolt.DB) StableLog {
 	var base uint64 = 1
-	_ = db.Update(func(tx *bolt.Tx) error {
-		_, _ = tx.CreateBucketIfNotExists([]byte("log"))
-		meta, _ := tx.CreateBucketIfNotExists([]byte("meta"))
+	err := db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte("log"))
+		if err != nil {
+			return err
+		}
+		meta, err := tx.CreateBucketIfNotExists([]byte("meta"))
+		if err != nil {
+			return err
+		}
 		if v := meta.Get([]byte("firstIndex")); v != nil {
 			base = binary.BigEndian.Uint64(v)
 		} else {
 			var b [8]byte
 			binary.BigEndian.PutUint64(b[:], base)
-			_ = meta.Put([]byte("firstIndex"), b[:])
+			err = meta.Put([]byte("firstIndex"), b[:])
+			if err != nil {
+				return err
+			}
 		}
 		return nil
 	})
+	if err != nil {
+		panic(err) // This is a critical initialization error
+	}
 	return &boltLog{db: db, base: base}
 }
 
@@ -63,33 +76,44 @@ func (l *boltLog) Append(entries ...LogEntry) int {
 	defer l.mu.Unlock()
 
 	var last uint64
-	_ = l.db.Update(func(tx *bolt.Tx) error {
+	err := l.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("log"))
 		for _, e := range entries {
 			last = uint64(l.LastIndex() + 1)
 			var buf bytes.Buffer
-			_ = gob.NewEncoder(&buf).Encode(e)
-			_ = b.Put(u64ToKey(last), buf.Bytes())
+			if err := gob.NewEncoder(&buf).Encode(e); err != nil {
+				return err
+			}
+			if err := b.Put(u64ToKey(last), buf.Bytes()); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
+	if err != nil {
+		// Return the last successful index or 0 if no entries were appended
+		return int(last - 1)
+	}
 	return int(last)
 }
 
-func (l *boltLog) At(idx int) (LogEntry, bool) {
-	var e LogEntry
-	if idx < int(l.base) {
-		return e, false
+func (l *boltLog) At(index int) (LogEntry, bool) {
+	if index < int(l.base) {
+		return LogEntry{}, false
 	}
-	_ = l.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket([]byte("log")).Get(u64ToKey(uint64(idx)))
-		if v == nil {
-			return nil
+
+	var entry LogEntry
+	err := l.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("log"))
+		if v := b.Get(u64ToKey(uint64(index))); v != nil {
+			return gob.NewDecoder(bytes.NewReader(v)).Decode(&entry)
 		}
-		_ = gob.NewDecoder(bytes.NewReader(v)).Decode(&e)
 		return nil
 	})
-	return e, e.Term != 0 || e.Command != nil
+	if err != nil {
+		return LogEntry{}, false
+	}
+	return entry, true
 }
 
 func (l *boltLog) LastIndexTerm() (int, int) {
@@ -111,8 +135,19 @@ func (l *boltLog) LastIndexTerm() (int, int) {
 }
 
 func (l *boltLog) LastIndex() int {
-	i, _ := l.LastIndexTerm()
-	return i
+	var last uint64
+	err := l.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("log"))
+		c := b.Cursor()
+		if k, _ := c.Last(); k != nil {
+			last = keyToU64(k)
+		}
+		return nil
+	})
+	if err != nil {
+		return int(l.base - 1)
+	}
+	return int(last)
 }
 
 func (l *boltLog) FirstIndex() int {
@@ -121,27 +156,39 @@ func (l *boltLog) FirstIndex() int {
 
 // ------------ snapshot compaction ---------------
 func (l *boltLog) TruncateBefore(index int) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	if index <= int(l.base) {
+		return
+	}
 
-	_ = l.db.Update(func(tx *bolt.Tx) error {
+	err := l.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("log"))
 		c := b.Cursor()
 		for k, _ := c.First(); k != nil && keyToU64(k) < uint64(index); k, _ = c.Next() {
-			_ = c.Delete()
+			if err := c.Delete(); err != nil {
+				return err
+			}
 		}
-
-		return nil
+		meta := tx.Bucket([]byte("meta"))
+		var buf [8]byte
+		binary.BigEndian.PutUint64(buf[:], uint64(index))
+		return meta.Put([]byte("firstIndex"), buf[:])
 	})
+	if err != nil {
+		// Log the error but continue
+		fmt.Printf("Error truncating log: %v\n", err)
+	}
+	l.base = uint64(index)
 }
 
 func (l *boltLog) TruncateSuffix(idx int) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	if idx < int(l.base) {
+		return fmt.Errorf("index %d is before first index %d", idx, l.base)
+	}
+
 	return l.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("log"))
 		c := b.Cursor()
-		for k, _ := c.Seek(u64ToKey(uint64(idx))); k != nil; k, _ = c.Next() {
+		for k, _ := c.Seek(u64ToKey(uint64(idx + 1))); k != nil; k, _ = c.Next() {
 			if err := c.Delete(); err != nil {
 				return err
 			}
